@@ -21,13 +21,21 @@
 #define MAX_PORT 3
 #define BUF_SIZE 2048
 #define TOKEN_MAX 512
+#define CONTROL_PORT 4000
+
+// Debug macro - only prints if DEBUG is defined at compile time
+#ifdef DEBUG_ENABLED
+#define DEBUG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define DEBUG(fmt, ...) /* disabled */
+#endif
 
 // Control protocol fields (16-bit unsigned big-endian)
 #define OP_READ 1
 #define OP_WRITE 2
 #define OBJ_OUT1 1
-#define PROP_FREQ 1
-#define PROP_AMP 2
+#define PROP_FREQ 255      // Property ID 255 = Frequency
+#define PROP_AMP 170       // Property ID 170 = Amplitude
 
 struct conn {
 	int port;
@@ -81,14 +89,18 @@ static void trim(char *s) {
 	s[j - i + 1] = '\0';
 }
 
-static void send_write16(int fd, uint16_t obj, uint16_t prop, uint16_t value) {
-	uint16_t msg[4];
-	msg[0] = htons(OP_WRITE);
+static int create_control_socket(void) {
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+	return fd;
+}
+
+static void send_read_command(int fd, struct sockaddr_in *addr, uint16_t obj, uint16_t prop) {
+	uint16_t msg[3];
+	msg[0] = htons(OP_READ);
 	msg[1] = htons(obj);
 	msg[2] = htons(prop);
-	msg[3] = htons(value);
-	ssize_t sent = send(fd, msg, sizeof(msg), 0);
-	(void)sent;
+	sendto(fd, msg, sizeof(msg), MSG_CONFIRM, (const struct sockaddr *)addr, sizeof(*addr));
 }
 
 int main(void) {
@@ -102,6 +114,14 @@ int main(void) {
         conns[i].have = 0;
         conns[i].last_connect_try = 0;
     }
+
+    // Create UDP control socket
+    int ctrl_fd = create_control_socket();
+    struct sockaddr_in ctrl_addr;
+    memset(&ctrl_addr, 0, sizeof(ctrl_addr));
+    ctrl_addr.sin_family = AF_INET;
+    ctrl_addr.sin_port = htons(CONTROL_PORT);
+    inet_pton(AF_INET, "127.0.0.1", &ctrl_addr.sin_addr);
 
     long long now_ms = epoch_ms_now();
     long long next_tick = now_ms + (20 - (now_ms % 20));
@@ -225,17 +245,30 @@ int main(void) {
             }
 
             if (state != -1 && state != last_state) {
-                // send settings to output1 over its connection if available
-                if (conns[0].fd >= 0) {
+                // send settings to output1 over UDP control port
+                DEBUG("State change detected: %d -> %d, out3=%.1f", last_state, state, v3);
+                if (ctrl_fd >= 0) {
                     if (state == 1) {
-                        // >=3.0 -> freq 1Hz, amp 8000
-                        send_write16(conns[0].fd, OBJ_OUT1, PROP_FREQ, (uint16_t)1);
-                        send_write16(conns[0].fd, OBJ_OUT1, PROP_AMP, (uint16_t)8000);
+                        // >=3.0 -> freq 1kHz (1000), amp 8000
+                        DEBUG("Sending: freq=1000 (1kHz), amp=8000 (threshold reached)");
+                        sendto(ctrl_fd, &(uint16_t[4]){htons(OP_WRITE), htons(OBJ_OUT1), htons(PROP_FREQ), htons(1000)}, 8, MSG_CONFIRM, (const struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr));
+                        sendto(ctrl_fd, &(uint16_t[4]){htons(OP_WRITE), htons(OBJ_OUT1), htons(PROP_AMP), htons(8000)}, 8, MSG_CONFIRM, (const struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr));
+                        // Verify by reading back
+                        DEBUG("Verifying frequency and amplitude...");
+                        send_read_command(ctrl_fd, &ctrl_addr, OBJ_OUT1, PROP_FREQ);
+                        send_read_command(ctrl_fd, &ctrl_addr, OBJ_OUT1, PROP_AMP);
                     } else {
-                        // <3.0 -> freq 2Hz, amp 4000
-                        send_write16(conns[0].fd, OBJ_OUT1, PROP_FREQ, (uint16_t)2);
-                        send_write16(conns[0].fd, OBJ_OUT1, PROP_AMP, (uint16_t)4000);
+                        // <3.0 -> freq 2kHz (2000), amp 4000
+                        DEBUG("Sending: freq=2000 (2kHz), amp=4000 (threshold not reached)");
+                        sendto(ctrl_fd, &(uint16_t[4]){htons(OP_WRITE), htons(OBJ_OUT1), htons(PROP_FREQ), htons(2000)}, 8, MSG_CONFIRM, (const struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr));
+                        sendto(ctrl_fd, &(uint16_t[4]){htons(OP_WRITE), htons(OBJ_OUT1), htons(PROP_AMP), htons(4000)}, 8, MSG_CONFIRM, (const struct sockaddr *)&ctrl_addr, sizeof(ctrl_addr));
+                        // Verify by reading back
+                        DEBUG("Verifying frequency and amplitude...");
+                        send_read_command(ctrl_fd, &ctrl_addr, OBJ_OUT1, PROP_FREQ);
+                        send_read_command(ctrl_fd, &ctrl_addr, OBJ_OUT1, PROP_AMP);
                     }
+                } else {
+                    DEBUG("ERROR: Control socket not available (fd=%d)", ctrl_fd);
                 }
                 last_state = state;
             }

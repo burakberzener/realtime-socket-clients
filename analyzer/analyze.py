@@ -198,7 +198,7 @@ def main(argv):
     if len(argv) > 1:
         path = argv[1]
     else:
-        path = 'out.jsonl'
+        path = 'out2.json'
     t_ms, streams = parse_file(path)
     if len(t_ms) == 0:
         print('No data found in', path)
